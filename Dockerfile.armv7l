@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1.7
+# Minimal ARMv7l Dockerfile — Alpine runtime, multi-stage build
+
+# ============================================================
+# Stage 1: Install production dependencies (needs build tools
+# for better-sqlite3 native compilation under QEMU/armv7l)
+# ============================================================
+FROM node:20-alpine AS deps
+
+RUN apk add --no-cache python3 make g++
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY shared/package.json ./shared/
+COPY server/package.json ./server/
+COPY client/package.json ./client/
+
+RUN npm ci
+
+# ============================================================
+# Stage 2: Build TypeScript sources
+# ============================================================
+FROM deps AS build
+WORKDIR /app
+
+COPY . .
+
+RUN npm run build
+
+# Strip dev dependencies (saves ~100MB+)
+RUN npm prune --omit=dev && rm -rf /root/.npm /root/.cache
+
+# ============================================================
+# Stage 3: Runtime — Alpine-based, minimal footprint
+# ============================================================
+FROM node:20-alpine AS runtime
+
+# tini for proper PID 1 signal handling
+RUN apk add --no-cache tini
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=3001
+
+# Only copy what's needed at runtime
+COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/shared ./shared
+COPY --from=build --chown=node:node /app/server/package.json ./server/package.json
+COPY --from=build --chown=node:node /app/server/dist ./server/dist
+COPY --from=build --chown=node:node /app/client/dist ./client/dist
+
+# Ensure data directory is writable by node user
+RUN mkdir -p /app/server/data && chown -R node:node /app/server/data
+
+USER node
+
+EXPOSE 3001
+VOLUME ["/app/server/data"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3001) + '/api/ping').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1));"
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "server/dist/index.js"]
